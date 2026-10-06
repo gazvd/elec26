@@ -8,6 +8,27 @@ import numpy as np
 
 # Configuração da página
 st.set_page_config(page_title="Dashboard Eleições Recife", layout="wide")
+
+# --- SISTEMA DE SENHA ---
+def check_password():
+    """Verifica se o usuário digitou a senha correta."""
+    if st.session_state.get("password_correct", False):
+        return True
+
+    st.markdown("### 🔒 Acesso Restrito")
+    st.text_input("Digite a senha para acessar o painel:", type="password", key="password")
+    
+    # A SENHA AGORA É LIDA DE FORMA SEGURA DOS SECRETS
+    if st.session_state["password"] == st.secrets["password"]:
+        st.session_state["password_correct"] = True
+        st.rerun()
+    elif st.session_state["password"]:
+        st.error("Senha incorreta. Tente novamente.")
+    return False
+
+if not check_password():
+    st.stop() # Para o código aqui se não tiver a senha
+
 st.title("📊 Dashboard de Resultados Eleitorais - Recife")
 
 @st.cache_data
