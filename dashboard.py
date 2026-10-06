@@ -114,6 +114,9 @@ bairro_sel = st.sidebar.selectbox("Bairro", bairros_disp)
 zonas_disp = ["Todas"] + sorted(df_base['zona'].dropna().unique())
 zona_sel = st.sidebar.selectbox("Zona", zonas_disp)
 
+secoes_disp = ["Todas"] + sorted(df_base['secao'].dropna().astype(int).unique())
+secao_sel = st.sidebar.selectbox("Seção", secoes_disp)
+
 st.sidebar.header("Visualização do Mapa")
 nivel_agregacao = st.sidebar.radio("Agrupar dados por:", ["Colégio (Seções)", "Bairro", "Zona"])
 
@@ -121,12 +124,14 @@ nivel_agregacao = st.sidebar.radio("Agrupar dados por:", ["Colégio (Seções)",
 mask_est = (df_estatisticas['ano'] == ano_sel) & (df_estatisticas['turno'] == turno_sel) & (df_estatisticas['cargo'] == cargo_sel)
 if bairro_sel != "Todos": mask_est &= (df_estatisticas['bairro'] == bairro_sel)
 if zona_sel != "Todas": mask_est &= (df_estatisticas['zona'] == zona_sel)
+if secao_sel != "Todas": mask_est &= (df_estatisticas['secao'] == secao_sel)
 df_est_filtrado = df_estatisticas[mask_est]
 
 mask_vot = mask_base.copy()
 if partido_sel != "Todos": mask_vot &= (df_votos['sigla_partido'] == partido_sel)
 if bairro_sel != "Todos": mask_vot &= (df_votos['bairro'] == bairro_sel)
 if zona_sel != "Todas": mask_vot &= (df_votos['zona'] == zona_sel)
+if secao_sel != "Todas": mask_vot &= (df_votos['secao'] == secao_sel)
 df_votos_filtrado = df_votos[mask_vot]
 
 # --- CARDS DE KPI ---
@@ -140,7 +145,17 @@ total_comparecimento = df_kpi['comparecimento'].sum()
 total_abstencoes = df_kpi['abstencoes'].sum()
 total_brancos = df_kpi['votos_brancos'].sum()
 total_nulos = df_kpi['votos_nulos'].sum()
-total_validos = df_kpi['votos_nominais'].sum() + df_kpi['votos_legenda'].sum()
+
+# Adequação para cargos proporcionais (Vereador, Dep. Estadual, Dep. Federal)
+if cargo_sel.lower() in ['vereador', 'deputado estadual', 'deputado federal']:
+    # A base de candidatos (recife.zip) contém apenas Votos Nominais.
+    # Ocultamos os votos de legenda no KPI para bater exatamente com a soma da tabela.
+    total_validos = df_kpi['votos_nominais'].sum()
+    label_kpi_votos = "Votos Nominais"
+else:
+    # Majoritários não possuem legenda
+    total_validos = df_kpi['votos_nominais'].sum() + df_kpi['votos_legenda'].sum()
+    label_kpi_votos = "Votos Válidos"
 
 votos_partido = df_votos_filtrado['total_votos'].sum()
 
@@ -151,14 +166,14 @@ pct_brancos = (total_brancos / total_comparecimento * 100) if total_comparecimen
 
 col1, col2, col3, col4, col5 = st.columns(5)
 if partido_sel != "Todos":
-    col1.metric(f"Votos ({partido_sel})", f"{votos_partido:,}")
+    col1.metric(f"Votos ({partido_sel})", f"{votos_partido:,}".replace(",", "."))
 else:
-    col1.metric("Votos Válidos", f"{total_validos:,}")
+    col1.metric(label_kpi_votos, f"{total_validos:,}".replace(",", "."))
 
-col2.metric("Abstenção", f"{total_abstencoes:,}", f"{pct_abstencao:.1f}%", delta_color="inverse")
-col3.metric("Comparecimento", f"{total_comparecimento:,}")
-col4.metric("Votos Nulos", f"{total_nulos:,}", f"{pct_nulos:.1f}%", delta_color="off")
-col5.metric("Votos Brancos", f"{total_brancos:,}", f"{pct_brancos:.1f}%", delta_color="off")
+col2.metric("Abstenção", f"{total_abstencoes:,}".replace(",", "."), f"{pct_abstencao:.1f}%".replace(".", ","), delta_color="inverse")
+col3.metric("Comparecimento", f"{total_comparecimento:,}".replace(",", "."))
+col4.metric("Votos Nulos", f"{total_nulos:,}".replace(",", "."), f"{pct_nulos:.1f}%".replace(".", ","), delta_color="off")
+col5.metric("Votos Brancos", f"{total_brancos:,}".replace(",", "."), f"{pct_brancos:.1f}%".replace(".", ","), delta_color="off")
 
 st.divider()
 
@@ -329,7 +344,10 @@ if map_data:
                     zona_col_nome = df_table.loc[idx_min, 'zona']
                     
                     df_colegio = df_table[df_table['colegio_id'] == filtro_clique]
-                    secoes_list = sorted(df_colegio['secao'].dropna().unique())
+                    
+                    # Buscar todas as seções desse colégio na base de estatísticas (sem o filtro de partido)
+                    df_est_col = df_est_filtrado[df_est_filtrado['colegio_id'] == filtro_clique]
+                    secoes_list = sorted(df_est_col['secao'].dropna().unique())
                     secoes_str = ", ".join([str(int(s)) for s in secoes_list])
                     
                     secoes_informativo = f"**Colégio {filtro_clique}** (Zona {zona_col_nome} - Bairro {bairro_col_nome})<br>📍 **Seções neste local:** {secoes_str}"
