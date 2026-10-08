@@ -5,6 +5,8 @@ from shapely.geometry import Point
 import folium
 from streamlit_folium import folium_static
 import numpy as np
+import os
+import zipfile
 
 # Configuração da página
 st.set_page_config(page_title="Dashboard Eleições Recife", layout="wide")
@@ -41,9 +43,31 @@ st.title("📊 Dashboard de Resultados Eleitorais - Recife")
 
 @st.cache_data
 def load_data():
-    # 1. Carregar estatísticas e votos (recife.zip)
+    # 1. Carregar estatísticas e votos (recife_candidatos.zip, recife_candidatos.parquet ou recife.zip)
     df_estatisticas = pd.read_csv('estatisticas_votacaorecife.csv')
-    df_votos = pd.read_csv('recife.zip')
+    
+    df_votos = None
+    # Verifica primeiro se existe arquivo zip contendo o parquet
+    for zip_path in ['recife_candidatos.zip', 'recife_candidatos.parquet.zip']:
+        if os.path.exists(zip_path):
+            with zipfile.ZipFile(zip_path, 'r') as z:
+                parquet_files = [f for f in z.namelist() if f.endswith('.parquet')]
+                if parquet_files:
+                    with z.open(parquet_files[0]) as f:
+                        df_votos = pd.read_parquet(f)
+                    break
+    
+    # Se não encontrou no zip, tenta o parquet direto ou recife.zip
+    if df_votos is None:
+        if os.path.exists('recife_candidatos.parquet'):
+            df_votos = pd.read_parquet('recife_candidatos.parquet')
+        elif os.path.exists('recife.zip'):
+            df_votos = pd.read_csv('recife.zip')
+            df_votos['nome_urna'] = df_votos['sigla_partido']
+            df_votos['numero_candidato'] = 0
+            df_votos['resultado'] = ''
+        else:
+            raise FileNotFoundError("Nenhum arquivo de dados de votos encontrado.")
     
     # 2. Carregar a base consolidada de seções e locais (de_para_secoes_bairros.csv)
     # Contém todas as seções mapeadas, coordenadas tratadas e bairros padronizados
@@ -115,8 +139,22 @@ st.sidebar.header("Filtros Opcionais")
 mask_base = (df_votos['ano'] == ano_sel) & (df_votos['turno'] == turno_sel) & (df_votos['cargo'] == cargo_sel)
 df_base = df_votos[mask_base]
 
-partidos_disp = ["Todos"] + sorted(df_base['sigla_partido'].dropna().unique())
-partido_sel = st.sidebar.selectbox("Partido", partidos_disp)
+tem_candidato_real = 'nome_urna' in df_base.columns and (df_base['nome_urna'].astype(str) != df_base['sigla_partido'].astype(str)).any()
+modo_analise = st.sidebar.radio("Análise Principal por:", ["Candidato", "Partido"] if tem_candidato_real else ["Partido"])
+
+candidato_sel = "Todos"
+partido_sel = "Todos"
+
+if modo_analise == "Candidato":
+    top_cands = df_base.groupby('nome_urna')['total_votos'].sum().sort_values(ascending=False).index.tolist()
+    opcoes_cands = ["Todos"] + [c for c in top_cands if pd.notna(c) and str(c).strip() != ""]
+    candidato_sel = st.sidebar.selectbox("Candidato", opcoes_cands)
+    
+    partidos_disp = ["Todos"] + sorted(df_base['sigla_partido'].dropna().unique())
+    partido_sel = st.sidebar.selectbox("Partido (Opcional)", partidos_disp)
+else:
+    partidos_disp = ["Todos"] + sorted(df_base['sigla_partido'].dropna().unique())
+    partido_sel = st.sidebar.selectbox("Partido", partidos_disp)
 
 zonas_disp = ["Todas"] + sorted(df_base['zona'].dropna().unique())
 zona_sel = st.sidebar.selectbox("Zona Eleitoral", zonas_disp)
@@ -157,7 +195,10 @@ if secao_sel != "Todas": mask_est &= (df_estatisticas['secao'] == secao_sel)
 df_est_filtrado = df_estatisticas[mask_est]
 
 mask_vot = mask_base.copy()
-if partido_sel != "Todos": mask_vot &= (df_votos['sigla_partido'] == partido_sel)
+if modo_analise == "Candidato" and candidato_sel != "Todos":
+    mask_vot &= (df_votos['nome_urna'] == candidato_sel)
+if partido_sel != "Todos":
+    mask_vot &= (df_votos['sigla_partido'] == partido_sel)
 if zona_sel != "Todas": mask_vot &= (df_votos['zona'] == zona_sel)
 if bairro_sel != "Todos": mask_vot &= (df_votos['bairro'] == bairro_sel)
 if sel_local_id is not None: mask_vot &= (df_votos['local_id'] == sel_local_id)
@@ -167,7 +208,6 @@ df_votos_filtrado = df_votos[mask_vot]
 # --- CARDS DE KPI ---
 st.markdown("### Resumo Geral (filtros aplicados)")
 
-# Para evitar dupla contagem, agregamos por zona/secao
 df_kpi = df_est_filtrado.drop_duplicates(subset=['zona', 'secao'])
 
 total_aptos = df_kpi['aptos'].sum()
@@ -176,18 +216,14 @@ total_abstencoes = df_kpi['abstencoes'].sum()
 total_brancos = df_kpi['votos_brancos'].sum()
 total_nulos = df_kpi['votos_nulos'].sum()
 
-# Adequação para cargos proporcionais (Vereador, Dep. Estadual, Dep. Federal)
 if cargo_sel.lower() in ['vereador', 'deputado estadual', 'deputado federal']:
-    # A base de candidatos (recife.zip) contém apenas Votos Nominais.
-    # Ocultamos os votos de legenda no KPI para bater exatamente com a soma da tabela.
     total_validos = df_kpi['votos_nominais'].sum()
     label_kpi_votos = "Votos Nominais"
 else:
-    # Majoritários não possuem legenda
     total_validos = df_kpi['votos_nominais'].sum() + df_kpi['votos_legenda'].sum()
     label_kpi_votos = "Votos Válidos"
 
-votos_partido = df_votos_filtrado['total_votos'].sum()
+votos_filtrados = df_votos_filtrado['total_votos'].sum()
 
 pct_abstencao = (total_abstencoes / total_aptos * 100) if total_aptos > 0 else 0
 pct_validos = (total_validos / total_comparecimento * 100) if total_comparecimento > 0 else 0
@@ -195,8 +231,12 @@ pct_nulos = (total_nulos / total_comparecimento * 100) if total_comparecimento >
 pct_brancos = (total_brancos / total_comparecimento * 100) if total_comparecimento > 0 else 0
 
 col1, col2, col3, col4, col5 = st.columns(5)
-if partido_sel != "Todos":
-    col1.metric(f"Votos ({partido_sel})", f"{votos_partido:,}".replace(",", "."))
+if modo_analise == "Candidato" and candidato_sel != "Todos":
+    pct_cand = (votos_filtrados / total_validos * 100) if total_validos > 0 else 0
+    col1.metric(f"Votos ({candidato_sel})", f"{votos_filtrados:,}".replace(",", "."), f"{pct_cand:.1f}%".replace(".", ","), delta_color="off")
+elif partido_sel != "Todos":
+    pct_part = (votos_filtrados / total_validos * 100) if total_validos > 0 else 0
+    col1.metric(f"Votos ({partido_sel})", f"{votos_filtrados:,}".replace(",", "."), f"{pct_part:.1f}%".replace(".", ","), delta_color="off")
 else:
     col1.metric(label_kpi_votos, f"{total_validos:,}".replace(",", "."))
 
@@ -228,101 +268,157 @@ def get_color(partido):
 
 if len(df_votos_filtrado) > 0:
     if nivel_agregacao == "Bairro":
-        agg_bairro = df_votos_filtrado.groupby(['bairro', 'sigla_partido'])['total_votos'].sum().reset_index()
-        bairros_map = bairros_gdf.copy()
-        
-        if partido_sel == "Todos":
-            idx_venc = agg_bairro.groupby('bairro')['total_votos'].idxmax()
-            venc_bairro = agg_bairro.loc[idx_venc]
-            bairros_map = bairros_map.merge(venc_bairro, left_on=bairro_col, right_on='bairro', how='inner')
-            
-            folium.GeoJson(
-                bairros_map,
-                style_function=lambda feature: {
-                    'fillColor': get_color(feature['properties'].get('sigla_partido')),
-                    'color': 'black', 'weight': 1, 'fillOpacity': 0.6
-                },
-                tooltip=folium.GeoJsonTooltip(fields=[bairro_col, 'sigla_partido', 'total_votos'],
-                                              aliases=['Bairro', 'Partido Vencedor', 'Votos'])
-            ).add_to(m)
+        if modo_analise == "Candidato":
+            agg_bairro = df_votos_filtrado.groupby(['bairro', 'nome_urna', 'sigla_partido'])['total_votos'].sum().reset_index()
+            bairros_map = bairros_gdf.copy()
+            if candidato_sel == "Todos":
+                idx_venc = agg_bairro.groupby('bairro')['total_votos'].idxmax()
+                venc_bairro = agg_bairro.loc[idx_venc]
+                bairros_map = bairros_map.merge(venc_bairro, left_on=bairro_col, right_on='bairro', how='inner')
+                folium.GeoJson(
+                    bairros_map,
+                    style_function=lambda feature: {
+                        'fillColor': get_color(feature['properties'].get('sigla_partido')),
+                        'color': 'black', 'weight': 1, 'fillOpacity': 0.6
+                    },
+                    tooltip=folium.GeoJsonTooltip(fields=[bairro_col, 'nome_urna', 'sigla_partido', 'total_votos'],
+                                                  aliases=['Bairro', 'Candidato Líder', 'Partido', 'Votos'])
+                ).add_to(m)
+            else:
+                bairros_map = bairros_map.merge(agg_bairro, left_on=bairro_col, right_on='bairro', how='inner')
+                folium.GeoJson(
+                    bairros_map,
+                    style_function=lambda feature: {
+                        'fillColor': get_color(feature['properties'].get('sigla_partido')),
+                        'color': 'black', 'weight': 1, 'fillOpacity': 0.6
+                    },
+                    tooltip=folium.GeoJsonTooltip(fields=[bairro_col, 'nome_urna', 'sigla_partido', 'total_votos'],
+                                                  aliases=['Bairro', 'Candidato', 'Partido', 'Votos'])
+                ).add_to(m)
         else:
-            bairros_map = bairros_map.merge(agg_bairro, left_on=bairro_col, right_on='bairro', how='inner')
-            folium.GeoJson(
-                bairros_map,
-                style_function=lambda feature: {
-                    'fillColor': get_color(partido_sel),
-                    'color': 'black', 'weight': 1, 'fillOpacity': 0.6
-                },
-                tooltip=folium.GeoJsonTooltip(fields=[bairro_col, 'sigla_partido', 'total_votos'],
-                                              aliases=['Bairro', 'Partido', 'Votos'])
-            ).add_to(m)
+            agg_bairro = df_votos_filtrado.groupby(['bairro', 'sigla_partido'])['total_votos'].sum().reset_index()
+            bairros_map = bairros_gdf.copy()
+            if partido_sel == "Todos":
+                idx_venc = agg_bairro.groupby('bairro')['total_votos'].idxmax()
+                venc_bairro = agg_bairro.loc[idx_venc]
+                bairros_map = bairros_map.merge(venc_bairro, left_on=bairro_col, right_on='bairro', how='inner')
+                folium.GeoJson(
+                    bairros_map,
+                    style_function=lambda feature: {
+                        'fillColor': get_color(feature['properties'].get('sigla_partido')),
+                        'color': 'black', 'weight': 1, 'fillOpacity': 0.6
+                    },
+                    tooltip=folium.GeoJsonTooltip(fields=[bairro_col, 'sigla_partido', 'total_votos'],
+                                                  aliases=['Bairro', 'Partido Vencedor', 'Votos'])
+                ).add_to(m)
+            else:
+                bairros_map = bairros_map.merge(agg_bairro, left_on=bairro_col, right_on='bairro', how='inner')
+                folium.GeoJson(
+                    bairros_map,
+                    style_function=lambda feature: {
+                        'fillColor': get_color(partido_sel),
+                        'color': 'black', 'weight': 1, 'fillOpacity': 0.6
+                    },
+                    tooltip=folium.GeoJsonTooltip(fields=[bairro_col, 'sigla_partido', 'total_votos'],
+                                                  aliases=['Bairro', 'Partido', 'Votos'])
+                ).add_to(m)
 
     elif nivel_agregacao == "Zona":
-        # Descobrir a zona predominante de cada bairro para agrupar as geometrias de forma limpa
         bairro_zona = df_votos_filtrado.groupby(['bairro', 'zona'])['total_votos'].sum().reset_index()
         if len(bairro_zona) > 0:
             idx_bz = bairro_zona.groupby('bairro')['total_votos'].idxmax()
             bairro_pred_zona = bairro_zona.loc[idx_bz, ['bairro', 'zona']]
-            
-            # Mesclar a zona predominante no shapefile dos bairros e fazer dissolve (agrupar polígonos)
             bairros_map = bairros_gdf.merge(bairro_pred_zona, left_on=bairro_col, right_on='bairro', how='inner')
             zonas_poly = bairros_map.dissolve(by='zona').reset_index()
             
-            agg_zona = df_votos_filtrado.groupby(['zona', 'sigla_partido'])['total_votos'].sum().reset_index()
-            
-            if partido_sel == "Todos":
-                idx_venc = agg_zona.groupby('zona')['total_votos'].idxmax()
-                venc_zona = agg_zona.loc[idx_venc]
-                zonas_poly = zonas_poly.merge(venc_zona, on='zona', how='inner')
-                
-                folium.GeoJson(
-                    zonas_poly,
-                    style_function=lambda feature: {
-                        'fillColor': get_color(feature['properties'].get('sigla_partido')),
-                        'color': 'black', 'weight': 1.5, 'fillOpacity': 0.6
-                    },
-                    tooltip=folium.GeoJsonTooltip(fields=['zona', 'sigla_partido', 'total_votos'],
-                                                  aliases=['Zona Eleitoral', 'Partido Vencedor', 'Votos'])
-                ).add_to(m)
+            if modo_analise == "Candidato":
+                agg_zona = df_votos_filtrado.groupby(['zona', 'nome_urna', 'sigla_partido'])['total_votos'].sum().reset_index()
+                if candidato_sel == "Todos":
+                    idx_venc = agg_zona.groupby('zona')['total_votos'].idxmax()
+                    venc_zona = agg_zona.loc[idx_venc]
+                    zonas_poly = zonas_poly.merge(venc_zona, on='zona', how='inner')
+                    folium.GeoJson(
+                        zonas_poly,
+                        style_function=lambda feature: {
+                            'fillColor': get_color(feature['properties'].get('sigla_partido')),
+                            'color': 'black', 'weight': 1.5, 'fillOpacity': 0.6
+                        },
+                        tooltip=folium.GeoJsonTooltip(fields=['zona', 'nome_urna', 'sigla_partido', 'total_votos'],
+                                                      aliases=['Zona Eleitoral', 'Candidato Líder', 'Partido', 'Votos'])
+                    ).add_to(m)
+                else:
+                    zonas_poly = zonas_poly.merge(agg_zona, on='zona', how='inner')
+                    folium.GeoJson(
+                        zonas_poly,
+                        style_function=lambda feature: {
+                            'fillColor': get_color(feature['properties'].get('sigla_partido')),
+                            'color': 'black', 'weight': 1.5, 'fillOpacity': 0.6
+                        },
+                        tooltip=folium.GeoJsonTooltip(fields=['zona', 'nome_urna', 'sigla_partido', 'total_votos'],
+                                                      aliases=['Zona Eleitoral', 'Candidato', 'Partido', 'Votos'])
+                    ).add_to(m)
             else:
-                zonas_poly = zonas_poly.merge(agg_zona, on='zona', how='inner')
-                folium.GeoJson(
-                    zonas_poly,
-                    style_function=lambda feature: {
-                        'fillColor': get_color(partido_sel),
-                        'color': 'black', 'weight': 1.5, 'fillOpacity': 0.6
-                    },
-                    tooltip=folium.GeoJsonTooltip(fields=['zona', 'sigla_partido', 'total_votos'],
-                                                  aliases=['Zona Eleitoral', 'Partido', 'Votos'])
-                ).add_to(m)
+                agg_zona = df_votos_filtrado.groupby(['zona', 'sigla_partido'])['total_votos'].sum().reset_index()
+                if partido_sel == "Todos":
+                    idx_venc = agg_zona.groupby('zona')['total_votos'].idxmax()
+                    venc_zona = agg_zona.loc[idx_venc]
+                    zonas_poly = zonas_poly.merge(venc_zona, on='zona', how='inner')
+                    folium.GeoJson(
+                        zonas_poly,
+                        style_function=lambda feature: {
+                            'fillColor': get_color(feature['properties'].get('sigla_partido')),
+                            'color': 'black', 'weight': 1.5, 'fillOpacity': 0.6
+                        },
+                        tooltip=folium.GeoJsonTooltip(fields=['zona', 'sigla_partido', 'total_votos'],
+                                                      aliases=['Zona Eleitoral', 'Partido Vencedor', 'Votos'])
+                    ).add_to(m)
+                else:
+                    zonas_poly = zonas_poly.merge(agg_zona, on='zona', how='inner')
+                    folium.GeoJson(
+                        zonas_poly,
+                        style_function=lambda feature: {
+                            'fillColor': get_color(partido_sel),
+                            'color': 'black', 'weight': 1.5, 'fillOpacity': 0.6
+                        },
+                        tooltip=folium.GeoJsonTooltip(fields=['zona', 'sigla_partido', 'total_votos'],
+                                                      aliases=['Zona Eleitoral', 'Partido', 'Votos'])
+                    ).add_to(m)
 
     else:
         # Colégio / Local de Votação
-        agg_colegio = df_votos_filtrado.dropna(subset=['latitude', 'longitude']).groupby(
-            ['local_id', 'nome_local', 'codigo_local', 'endereco', 'latitude', 'longitude', 'zona', 'bairro', 'sigla_partido'])['total_votos'].sum().reset_index()
+        cols_grp = ['local_id', 'nome_local', 'codigo_local', 'endereco', 'latitude', 'longitude', 'zona', 'bairro', 'sigla_partido']
+        if modo_analise == "Candidato":
+            cols_grp.append('nome_urna')
+            
+        agg_colegio = df_votos_filtrado.dropna(subset=['latitude', 'longitude']).groupby(cols_grp)['total_votos'].sum().reset_index()
         
         if len(agg_colegio) > 0:
-            if partido_sel == "Todos":
+            is_todos = (candidato_sel == "Todos") if modo_analise == "Candidato" else (partido_sel == "Todos")
+            if is_todos:
                 idx_venc = agg_colegio.groupby('local_id')['total_votos'].idxmax()
                 venc_colegio = agg_colegio.loc[idx_venc].copy()
                 
-                # Prepara os top 5 partidos mais votados por local
-                top_partidos = agg_colegio.sort_values(['local_id', 'total_votos'], ascending=[True, False]).groupby('local_id').head(5)
+                # Top 5 mais votados por local
+                top_items = agg_colegio.sort_values(['local_id', 'total_votos'], ascending=[True, False]).groupby('local_id').head(5)
                 dict_resultados = {}
-                for lid, group in top_partidos.groupby('local_id'):
-                    dict_resultados[lid] = group[['sigla_partido', 'total_votos']].to_dict('records')
+                for lid, group in top_items.groupby('local_id'):
+                    if modo_analise == "Candidato":
+                        dict_resultados[lid] = [f"<b>{r['nome_urna']}</b> ({r['sigla_partido']}): {r['total_votos']:,}".replace(",", ".") for _, r in group.iterrows()]
+                    else:
+                        dict_resultados[lid] = [f"<b>{r['sigla_partido']}</b>: {r['total_votos']:,}".replace(",", ".") for _, r in group.iterrows()]
                 venc_colegio['resultados'] = venc_colegio['local_id'].map(dict_resultados)
                 
                 for _, row in venc_colegio.iterrows():
-                    res_str = "<br>".join([f"<b>{r['sigla_partido']}</b>: {r['total_votos']:,}".replace(",", ".") for r in (row['resultados'] or [])])
+                    res_str = "<br>".join(row['resultados'] or [])
                     end_str = f"<br><small>{row['endereco']}</small>" if row['endereco'] else ""
                     cod_str = f" (Local {int(row['codigo_local'])})" if row['codigo_local'] > 0 else ""
                     popup_html = f"<b>{row['nome_local']}{cod_str}</b><br><b>Bairro:</b> {row['bairro']}<br><b>Zona:</b> {row['zona']}{end_str}<hr>{res_str}"
                     
+                    lider_str = f" - 1º: {row['nome_urna']}" if modo_analise == "Candidato" else f" - Z{row['zona']}"
                     folium.CircleMarker(
                         location=[row['latitude'], row['longitude']],
-                        radius=6, popup=folium.Popup(popup_html, max_width=280),
-                        tooltip=f"{row['nome_local']} (Z{row['zona']})",
+                        radius=6, popup=folium.Popup(popup_html, max_width=300),
+                        tooltip=f"{row['nome_local']}{lider_str}",
                         color='white', weight=1, fill=True,
                         fillColor=get_color(row['sigla_partido']), fillOpacity=0.9
                     ).add_to(m)
@@ -332,12 +428,13 @@ if len(df_votos_filtrado) > 0:
                     raio = 5 + (row['total_votos'] / max_votos * 10) if max_votos > 0 else 5
                     end_str = f"<br><small>{row['endereco']}</small>" if row['endereco'] else ""
                     cod_str = f" (Local {int(row['codigo_local'])})" if row['codigo_local'] > 0 else ""
-                    popup_html = f"<b>{row['nome_local']}{cod_str}</b><br><b>Bairro:</b> {row['bairro']}<br><b>Zona:</b> {row['zona']}{end_str}<hr><b>{row['sigla_partido']}</b>: {row['total_votos']:,} votos".replace(",", ".")
+                    label_selecionado = f"<b>{row['nome_urna']}</b> ({row['sigla_partido']})" if modo_analise == "Candidato" else f"<b>{row['sigla_partido']}</b>"
+                    popup_html = f"<b>{row['nome_local']}{cod_str}</b><br><b>Bairro:</b> {row['bairro']}<br><b>Zona:</b> {row['zona']}{end_str}<hr>{label_selecionado}: {row['total_votos']:,} votos".replace(",", ".")
                     
                     folium.CircleMarker(
                         location=[row['latitude'], row['longitude']],
                         radius=raio,
-                        popup=folium.Popup(popup_html, max_width=280),
+                        popup=folium.Popup(popup_html, max_width=300),
                         tooltip=f"{row['nome_local']} - Votos: {row['total_votos']:,}".replace(",", "."),
                         color='white', weight=1, fill=True,
                         fillColor=get_color(row['sigla_partido']), fillOpacity=0.9
@@ -372,11 +469,10 @@ if map_data:
         lat_click = map_data["last_object_clicked"].get("lat")
         lng_click = map_data["last_object_clicked"].get("lng")
         if lat_click and lng_click:
-            # Encontrar o colégio mais próximo do clique
             df_table['dist'] = (df_table['latitude'] - lat_click)**2 + (df_table['longitude'] - lng_click)**2
             if not df_table.empty:
                 idx_min = df_table['dist'].idxmin()
-                if df_table.loc[idx_min, 'dist'] < 0.0001: # Tolerância para o clique
+                if df_table.loc[idx_min, 'dist'] < 0.0001:
                     filtro_clique = df_table.loc[idx_min, 'local_id']
                     nome_col_clique = df_table.loc[idx_min, 'nome_local']
                     cod_col_clique = df_table.loc[idx_min, 'codigo_local']
@@ -386,7 +482,6 @@ if map_data:
                     
                     df_colegio = df_table[df_table['local_id'] == filtro_clique]
                     
-                    # Buscar todas as seções desse local (preferência para df_locais oficial se codigo_local > 0)
                     if cod_col_clique > 0:
                         secoes_list = sorted(df_locais[(df_locais['zona'] == zona_col_nome) & (df_locais['codigo_local'] == cod_col_clique)]['secao'].dropna().astype(int).unique())
                     else:
@@ -402,25 +497,31 @@ if map_data:
 if secoes_informativo:
     st.info(secoes_informativo)
 
+label_filtro = "Candidato" if modo_analise == "Candidato" else "Partido"
 if nivel_agregacao == "Bairro":
     if filtro_clique:
-        st.success(f"Mostrando consolidado de votos por partido no Bairro: **{filtro_clique}**")
+        st.success(f"Mostrando consolidado de votos por {label_filtro} no Bairro: **{filtro_clique}**")
     else:
         st.info("Mostrando consolidado geral da cidade. Clique em um Bairro no mapa para ver os dados isolados dele!")
 elif nivel_agregacao == "Zona":
     if filtro_clique:
-        st.success(f"Mostrando consolidado de votos por partido na Zona Eleitoral: **{filtro_clique}**")
+        st.success(f"Mostrando consolidado de votos por {label_filtro} na Zona Eleitoral: **{filtro_clique}**")
     else:
         st.info("Mostrando consolidado geral da cidade. Clique em uma Zona no mapa para ver os dados isolados dela!")
 else:
     if nome_clique:
-        st.success(f"Mostrando consolidado de votos por partido no Local de Votação: **{nome_clique}**")
+        st.success(f"Mostrando consolidado de votos por {label_filtro} no Local de Votação: **{nome_clique}**")
     else:
         st.info("Mostrando consolidado geral. Clique em um Colégio (círculo) no mapa para ver as seções que compõem aquele local e filtrar os dados!")
 
-# Focar na soma de votos do partido para o que está visível (seja cidade inteira ou a região clicada)
-df_show = df_table.groupby('sigla_partido')['total_votos'].sum().reset_index()
-df_show = df_show.rename(columns={'sigla_partido': 'Partido', 'total_votos': 'Total de Votos'})
+# Focar na soma de votos do candidato ou partido
+if modo_analise == "Candidato":
+    df_show = df_table.groupby(['nome_urna', 'sigla_partido'])['total_votos'].sum().reset_index()
+    df_show = df_show.rename(columns={'nome_urna': 'Candidato', 'sigla_partido': 'Partido', 'total_votos': 'Total de Votos'})
+else:
+    df_show = df_table.groupby('sigla_partido')['total_votos'].sum().reset_index()
+    df_show = df_show.rename(columns={'sigla_partido': 'Partido', 'total_votos': 'Total de Votos'})
+
 df_show = df_show.sort_values(by='Total de Votos', ascending=False)
 
 # Adicionar percentual
@@ -431,16 +532,17 @@ df_show['% do Válido Local'] = (df_show['Total de Votos'] / total_scope * 100).
 df_show['Total de Votos'] = df_show['Total de Votos'].apply(lambda x: f"{x:,.0f}".replace(",", "."))
 
 # Criar a linha de TOTAL
-linha_total = pd.DataFrame([{
-    'Partido': '🛑 TOTAL VÁLIDOS',
+col_rotulo = 'Candidato' if modo_analise == "Candidato" else 'Partido'
+dict_total = {
+    col_rotulo: '🛑 TOTAL VÁLIDOS',
     'Total de Votos': f"{total_scope:,.0f}".replace(",", "."),
     '% do Válido Local': '100,00%'
-}])
+}
+if modo_analise == "Candidato":
+    dict_total['Partido'] = '-'
 
-# Anexar a linha de total no início do dataframe
+linha_total = pd.DataFrame([dict_total])
 df_show = pd.concat([linha_total, df_show], ignore_index=True)
-
-# Ajustar o índice para começar em 1 (ou você pode omitir o índice visualmente)
 df_show.index = range(1, len(df_show) + 1)
 
 st.dataframe(df_show, use_container_width=True)
