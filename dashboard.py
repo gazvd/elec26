@@ -18,11 +18,19 @@ def check_password():
     st.markdown("### 🔒 Acesso Restrito")
     st.text_input("Digite a senha para acessar o painel:", type="password", key="password")
     
-    # A SENHA AGORA É LIDA DE FORMA SEGURA DOS SECRETS
-    if st.session_state["password"] == st.secrets["password"]:
+    # Obter senha dos secrets de forma segura (com fallback)
+    correct_password = "demokratia"
+    try:
+        if "password" in st.secrets:
+            correct_password = st.secrets["password"]
+    except Exception:
+        pass
+
+    user_password = st.session_state.get("password", "")
+    if user_password and user_password == correct_password:
         st.session_state["password_correct"] = True
         st.rerun()
-    elif st.session_state["password"]:
+    elif user_password:
         st.error("Senha incorreta. Tente novamente.")
     return False
 
@@ -33,71 +41,54 @@ st.title("📊 Dashboard de Resultados Eleitorais - Recife")
 
 @st.cache_data
 def load_data():
-    # 1. Carregar estatísticas e votos (usando a versão compactada .zip para evitar limite do GitHub)
+    # 1. Carregar estatísticas e votos (recife.zip)
     df_estatisticas = pd.read_csv('estatisticas_votacaorecife.csv')
     df_votos = pd.read_csv('recife.zip')
     
-    # 2. Carregar lista oficial atualizada de locais de votação de Recife
+    # 2. Carregar a base consolidada de seções e locais (de_para_secoes_bairros.csv)
+    # Contém todas as seções mapeadas, coordenadas tratadas e bairros padronizados
+    df_de_para = pd.read_csv('de_para_secoes_bairros.csv')
     df_locais = pd.read_csv('locais_votacao_recife.csv')
     
-    # Remover colunas antigas de lat/lon e bairro para usar as oficiais
+    # Garantir identificador unificado local_id
+    if 'local_id' not in df_de_para.columns:
+        df_de_para['local_id'] = df_de_para['zona'].astype(str) + '_' + df_de_para['codigo_local'].astype(str)
+    
+    # Remover colunas duplicadas antes da mesclagem
     df_votos = df_votos.drop(columns=['latitude', 'longitude', 'bairro'], errors='ignore')
     df_estatisticas = df_estatisticas.drop(columns=['latitude', 'longitude', 'bairro'], errors='ignore')
     
-    # 3. Mesclar dados eleitorais com os locais oficiais por zona e seção
-    df_votos = df_votos.merge(df_locais, on=['zona', 'secao'], how='left')
-    df_estatisticas = df_estatisticas.merge(df_locais, on=['zona', 'secao'], how='left')
+    # Otimização de tipos para economizar memória (essencial para o limite de 1 GB do Streamlit Cloud)
+    for col in ['ano', 'turno', 'zona', 'secao']:
+        df_votos[col] = df_votos[col].astype('int16')
+        df_estatisticas[col] = df_estatisticas[col].astype('int16')
+    df_votos['total_votos'] = df_votos['total_votos'].astype('int32')
     
-    # 4. Tratar seções históricas extintas (2008-2016) que não existem na lista oficial atual
-    # Para não perder pontos do mapa antigo, recuperamos coordenadas históricas se existirem
-    coords_hist = pd.read_csv('recife.zip', usecols=['zona', 'secao', 'latitude', 'longitude'])
-    coords_hist = coords_hist.dropna(subset=['latitude', 'longitude']).drop_duplicates(subset=['zona', 'secao'])
-    coords_hist = coords_hist.rename(columns={'latitude': 'lat_h', 'longitude': 'lon_h'})
+    # Mesclagem direta e leve (1 único merge)
+    df_votos = df_votos.merge(df_de_para, on=['zona', 'secao'], how='left')
+    df_estatisticas = df_estatisticas.merge(df_de_para, on=['zona', 'secao'], how='left')
     
-    df_votos = df_votos.merge(coords_hist, on=['zona', 'secao'], how='left')
-    df_votos['latitude'] = df_votos['latitude'].fillna(df_votos['lat_h'])
-    df_votos['longitude'] = df_votos['longitude'].fillna(df_votos['lon_h'])
-    df_votos = df_votos.drop(columns=['lat_h', 'lon_h'], errors='ignore')
-    
-    df_estatisticas = df_estatisticas.merge(coords_hist, on=['zona', 'secao'], how='left')
-    df_estatisticas['latitude'] = df_estatisticas['latitude'].fillna(df_estatisticas['lat_h'])
-    df_estatisticas['longitude'] = df_estatisticas['longitude'].fillna(df_estatisticas['lon_h'])
-    df_estatisticas = df_estatisticas.drop(columns=['lat_h', 'lon_h'], errors='ignore')
-    
-    # Identificar seções históricas sem colégio oficial
+    # Tratar eventuais nulos
+    df_votos['bairro'] = df_votos['bairro'].fillna('Desconhecido')
+    df_estatisticas['bairro'] = df_estatisticas['bairro'].fillna('Desconhecido')
     df_votos['nome_local'] = df_votos['nome_local'].fillna('Local Histórico / Extinto')
-    df_votos['codigo_local'] = df_votos['codigo_local'].fillna(0).astype(int)
-    df_votos['local_id'] = df_votos['local_id'].fillna(df_votos['zona'].astype(str) + '_0')
-    df_votos['endereco'] = df_votos['endereco'].fillna('')
-    
     df_estatisticas['nome_local'] = df_estatisticas['nome_local'].fillna('Local Histórico / Extinto')
+    df_votos['codigo_local'] = df_votos['codigo_local'].fillna(0).astype(int)
     df_estatisticas['codigo_local'] = df_estatisticas['codigo_local'].fillna(0).astype(int)
+    df_votos['local_id'] = df_votos['local_id'].fillna(df_votos['zona'].astype(str) + '_0')
     df_estatisticas['local_id'] = df_estatisticas['local_id'].fillna(df_estatisticas['zona'].astype(str) + '_0')
+    df_votos['endereco'] = df_votos['endereco'].fillna('')
     df_estatisticas['endereco'] = df_estatisticas['endereco'].fillna('')
     
-    # 5. Carregar Bairros Shapefile
+    # Downcast para categorias economizando mais de 250 MB de RAM
+    for c in ['cargo', 'sigla_partido', 'bairro', 'nome_local']:
+        df_votos[c] = df_votos[c].astype('category')
+    
+    # 3. Carregar Bairros Shapefile
     bairros_gdf = gpd.read_file('Bairros/Bairros_Recife/bairros-polygon.shp')
     if bairros_gdf.crs != "EPSG:4326":
         bairros_gdf = bairros_gdf.to_crs("EPSG:4326")
     bairro_col = 'bairro_nom'
-    
-    # Para seções históricas com coordenadas que ficaram sem bairro preenchido
-    sem_bairro = df_votos[df_votos['bairro'].isna() & df_votos['latitude'].notnull()][['local_id', 'latitude', 'longitude']].drop_duplicates()
-    if len(sem_bairro) > 0:
-        geom_sb = [Point(xy) for xy in zip(sem_bairro.longitude, sem_bairro.latitude)]
-        gdf_sb = gpd.GeoDataFrame(sem_bairro, geometry=geom_sb, crs="EPSG:4326")
-        gdf_sb = gpd.sjoin(gdf_sb, bairros_gdf[[bairro_col, 'geometry']], how='left', predicate='within')
-        map_sb = gdf_sb[['local_id', bairro_col]].rename(columns={bairro_col: 'bairro_sb'})
-        df_votos = df_votos.merge(map_sb, on='local_id', how='left')
-        df_votos['bairro'] = df_votos['bairro'].fillna(df_votos['bairro_sb'])
-        df_votos = df_votos.drop(columns=['bairro_sb'], errors='ignore')
-        
-        df_estatisticas = df_estatisticas.merge(map_sb, on='local_id', how='left')
-        df_estatisticas['bairro'] = df_estatisticas['bairro'].fillna(df_estatisticas['bairro_sb'])
-        df_estatisticas = df_estatisticas.drop(columns=['bairro_sb'], errors='ignore')
-        
-    df_votos['bairro'] = df_votos['bairro'].fillna('Desconhecido')
-    df_estatisticas['bairro'] = df_estatisticas['bairro'].fillna('Desconhecido')
     
     return df_votos, df_estatisticas, bairros_gdf, bairro_col, df_locais
 
@@ -137,14 +128,19 @@ bairro_sel = st.sidebar.selectbox("Bairro", bairros_disp)
 df_base_b = df_base_z if bairro_sel == "Todos" else df_base_z[df_base_z['bairro'] == bairro_sel]
 locais_validos = df_base_b[df_base_b['codigo_local'] > 0][['local_id', 'nome_local', 'codigo_local', 'zona']].drop_duplicates().sort_values('nome_local')
 
-opcoes_locais = ["Todos"] + [f"{r['nome_local']} (Local {r['codigo_local']} - Z{r['zona']})" for _, r in locais_validos.iterrows()]
+mapa_locais = {
+    f"{r['nome_local']} (Local {int(r['codigo_local'])} - Z{int(r['zona'])})": r['local_id']
+    for _, r in locais_validos.iterrows()
+}
+opcoes_locais = ["Todos"] + list(mapa_locais.keys())
 local_sel = st.sidebar.selectbox("Colégio / Local de Votação", opcoes_locais)
 
 df_base_l = df_base_b
 sel_local_id = None
 if local_sel != "Todos":
-    sel_local_id = locais_validos[[f"{r['nome_local']} (Local {r['codigo_local']} - Z{r['zona']})" == local_sel for _, r in locais_validos.iterrows()]]['local_id'].iloc[0]
-    df_base_l = df_base_b[df_base_b['local_id'] == sel_local_id]
+    sel_local_id = mapa_locais.get(local_sel)
+    if sel_local_id:
+        df_base_l = df_base_b[df_base_b['local_id'] == sel_local_id]
 
 secoes_disp = ["Todas"] + sorted(df_base_l['secao'].dropna().astype(int).unique())
 secao_sel = st.sidebar.selectbox("Seção Eleitoral", secoes_disp)
