@@ -37,54 +37,73 @@ def load_data():
     df_estatisticas = pd.read_csv('estatisticas_votacaorecife.csv')
     df_votos = pd.read_csv('recife.zip')
     
-    # 2. Arrumar as coordenadas. Apenas algumas linhas têm lat/lon.
-    # Vamos pegar a relação zona -> secao -> lat, lon
-    coords = df_votos.dropna(subset=['latitude', 'longitude'])[['zona', 'secao', 'latitude', 'longitude']]
-    coords = coords.drop_duplicates(subset=['zona', 'secao'])
+    # 2. Carregar lista oficial atualizada de locais de votação de Recife
+    df_locais = pd.read_csv('locais_votacao_recife.csv')
     
-    # Substituir as colunas lat/lon originais (pois estão incompletas) pelo mapeamento
-    df_votos = df_votos.drop(columns=['latitude', 'longitude'], errors='ignore')
-    df_votos = df_votos.merge(coords, on=['zona', 'secao'], how='left')
+    # Remover colunas antigas de lat/lon e bairro para usar as oficiais
+    df_votos = df_votos.drop(columns=['latitude', 'longitude', 'bairro'], errors='ignore')
+    df_estatisticas = df_estatisticas.drop(columns=['latitude', 'longitude', 'bairro'], errors='ignore')
     
-    # Fazer o mesmo para estatisticas
-    df_estatisticas = df_estatisticas.merge(coords, on=['zona', 'secao'], how='left')
+    # 3. Mesclar dados eleitorais com os locais oficiais por zona e seção
+    df_votos = df_votos.merge(df_locais, on=['zona', 'secao'], how='left')
+    df_estatisticas = df_estatisticas.merge(df_locais, on=['zona', 'secao'], how='left')
     
-    # 3. Definir Colégios (pontos únicos de lat/lon)
-    colegios_loc = coords[['latitude', 'longitude']].drop_duplicates().reset_index(drop=True)
-    colegios_loc['colegio_id'] = range(1, len(colegios_loc) + 1)
+    # 4. Tratar seções históricas extintas (2008-2016) que não existem na lista oficial atual
+    # Para não perder pontos do mapa antigo, recuperamos coordenadas históricas se existirem
+    coords_hist = pd.read_csv('recife.zip', usecols=['zona', 'secao', 'latitude', 'longitude'])
+    coords_hist = coords_hist.dropna(subset=['latitude', 'longitude']).drop_duplicates(subset=['zona', 'secao'])
+    coords_hist = coords_hist.rename(columns={'latitude': 'lat_h', 'longitude': 'lon_h'})
     
-    # Mapear colegio_id para coords
-    coords = coords.merge(colegios_loc, on=['latitude', 'longitude'], how='left')
+    df_votos = df_votos.merge(coords_hist, on=['zona', 'secao'], how='left')
+    df_votos['latitude'] = df_votos['latitude'].fillna(df_votos['lat_h'])
+    df_votos['longitude'] = df_votos['longitude'].fillna(df_votos['lon_h'])
+    df_votos = df_votos.drop(columns=['lat_h', 'lon_h'], errors='ignore')
     
-    # Mapear colegio_id para votos e estatisticas
-    df_votos = df_votos.merge(coords[['zona', 'secao', 'colegio_id']], on=['zona', 'secao'], how='left')
-    df_estatisticas = df_estatisticas.merge(coords[['zona', 'secao', 'colegio_id']], on=['zona', 'secao'], how='left')
+    df_estatisticas = df_estatisticas.merge(coords_hist, on=['zona', 'secao'], how='left')
+    df_estatisticas['latitude'] = df_estatisticas['latitude'].fillna(df_estatisticas['lat_h'])
+    df_estatisticas['longitude'] = df_estatisticas['longitude'].fillna(df_estatisticas['lon_h'])
+    df_estatisticas = df_estatisticas.drop(columns=['lat_h', 'lon_h'], errors='ignore')
     
-    # 4. Carregar Bairros e fazer Spatial Join
+    # Identificar seções históricas sem colégio oficial
+    df_votos['nome_local'] = df_votos['nome_local'].fillna('Local Histórico / Extinto')
+    df_votos['codigo_local'] = df_votos['codigo_local'].fillna(0).astype(int)
+    df_votos['local_id'] = df_votos['local_id'].fillna(df_votos['zona'].astype(str) + '_0')
+    df_votos['endereco'] = df_votos['endereco'].fillna('')
+    
+    df_estatisticas['nome_local'] = df_estatisticas['nome_local'].fillna('Local Histórico / Extinto')
+    df_estatisticas['codigo_local'] = df_estatisticas['codigo_local'].fillna(0).astype(int)
+    df_estatisticas['local_id'] = df_estatisticas['local_id'].fillna(df_estatisticas['zona'].astype(str) + '_0')
+    df_estatisticas['endereco'] = df_estatisticas['endereco'].fillna('')
+    
+    # 5. Carregar Bairros Shapefile
     bairros_gdf = gpd.read_file('Bairros/Bairros_Recife/bairros-polygon.shp')
     if bairros_gdf.crs != "EPSG:4326":
         bairros_gdf = bairros_gdf.to_crs("EPSG:4326")
+    bairro_col = 'bairro_nom'
+    
+    # Para seções históricas com coordenadas que ficaram sem bairro preenchido
+    sem_bairro = df_votos[df_votos['bairro'].isna() & df_votos['latitude'].notnull()][['local_id', 'latitude', 'longitude']].drop_duplicates()
+    if len(sem_bairro) > 0:
+        geom_sb = [Point(xy) for xy in zip(sem_bairro.longitude, sem_bairro.latitude)]
+        gdf_sb = gpd.GeoDataFrame(sem_bairro, geometry=geom_sb, crs="EPSG:4326")
+        gdf_sb = gpd.sjoin(gdf_sb, bairros_gdf[[bairro_col, 'geometry']], how='left', predicate='within')
+        map_sb = gdf_sb[['local_id', bairro_col]].rename(columns={bairro_col: 'bairro_sb'})
+        df_votos = df_votos.merge(map_sb, on='local_id', how='left')
+        df_votos['bairro'] = df_votos['bairro'].fillna(df_votos['bairro_sb'])
+        df_votos = df_votos.drop(columns=['bairro_sb'], errors='ignore')
         
-    bairro_col = 'bairro_nom' # Nome do bairro correto no shapefile
-    
-    geometry = [Point(xy) for xy in zip(colegios_loc.longitude, colegios_loc.latitude)]
-    colegios_gdf = gpd.GeoDataFrame(colegios_loc, geometry=geometry, crs="EPSG:4326")
-    colegios_gdf = gpd.sjoin(colegios_gdf, bairros_gdf, how='left', predicate='within')
-    
-    # Mapear bairro de volta para votos e estatisticas
-    bairro_mapping = colegios_gdf[['colegio_id', bairro_col]].rename(columns={bairro_col: 'bairro'})
-    df_votos = df_votos.merge(bairro_mapping, on='colegio_id', how='left')
-    df_estatisticas = df_estatisticas.merge(bairro_mapping, on='colegio_id', how='left')
-    
-    # Preencher bairro NaN com 'Desconhecido'
+        df_estatisticas = df_estatisticas.merge(map_sb, on='local_id', how='left')
+        df_estatisticas['bairro'] = df_estatisticas['bairro'].fillna(df_estatisticas['bairro_sb'])
+        df_estatisticas = df_estatisticas.drop(columns=['bairro_sb'], errors='ignore')
+        
     df_votos['bairro'] = df_votos['bairro'].fillna('Desconhecido')
     df_estatisticas['bairro'] = df_estatisticas['bairro'].fillna('Desconhecido')
     
-    return df_votos, df_estatisticas, bairros_gdf, bairro_col
+    return df_votos, df_estatisticas, bairros_gdf, bairro_col, df_locais
 
 try:
     with st.spinner("Carregando e processando dados espaciais..."):
-        df_votos, df_estatisticas, bairros_gdf, bairro_col = load_data()
+        df_votos, df_estatisticas, bairros_gdf, bairro_col, df_locais = load_data()
 except Exception as e:
     st.error(f"Erro ao carregar dados: {e}")
     st.stop()
@@ -101,36 +120,51 @@ cargos_disp = sorted(df_votos[(df_votos['ano'] == ano_sel) & (df_votos['turno'] 
 cargo_sel = st.sidebar.selectbox("Cargo", cargos_disp)
 
 st.sidebar.header("Filtros Opcionais")
-# Filtrar para alimentar as dropdowns dinamicamente
+# Filtrar para alimentar as dropdowns dinamicamente (em cascata)
 mask_base = (df_votos['ano'] == ano_sel) & (df_votos['turno'] == turno_sel) & (df_votos['cargo'] == cargo_sel)
 df_base = df_votos[mask_base]
 
 partidos_disp = ["Todos"] + sorted(df_base['sigla_partido'].dropna().unique())
 partido_sel = st.sidebar.selectbox("Partido", partidos_disp)
 
-bairros_disp = ["Todos"] + sorted(df_base['bairro'].dropna().astype(str).unique())
+zonas_disp = ["Todas"] + sorted(df_base['zona'].dropna().unique())
+zona_sel = st.sidebar.selectbox("Zona Eleitoral", zonas_disp)
+
+df_base_z = df_base if zona_sel == "Todas" else df_base[df_base['zona'] == zona_sel]
+bairros_disp = ["Todos"] + sorted(df_base_z['bairro'].dropna().astype(str).unique())
 bairro_sel = st.sidebar.selectbox("Bairro", bairros_disp)
 
-zonas_disp = ["Todas"] + sorted(df_base['zona'].dropna().unique())
-zona_sel = st.sidebar.selectbox("Zona", zonas_disp)
+df_base_b = df_base_z if bairro_sel == "Todos" else df_base_z[df_base_z['bairro'] == bairro_sel]
+locais_validos = df_base_b[df_base_b['codigo_local'] > 0][['local_id', 'nome_local', 'codigo_local', 'zona']].drop_duplicates().sort_values('nome_local')
 
-secoes_disp = ["Todas"] + sorted(df_base['secao'].dropna().astype(int).unique())
-secao_sel = st.sidebar.selectbox("Seção", secoes_disp)
+opcoes_locais = ["Todos"] + [f"{r['nome_local']} (Local {r['codigo_local']} - Z{r['zona']})" for _, r in locais_validos.iterrows()]
+local_sel = st.sidebar.selectbox("Colégio / Local de Votação", opcoes_locais)
+
+df_base_l = df_base_b
+sel_local_id = None
+if local_sel != "Todos":
+    sel_local_id = locais_validos[[f"{r['nome_local']} (Local {r['codigo_local']} - Z{r['zona']})" == local_sel for _, r in locais_validos.iterrows()]]['local_id'].iloc[0]
+    df_base_l = df_base_b[df_base_b['local_id'] == sel_local_id]
+
+secoes_disp = ["Todas"] + sorted(df_base_l['secao'].dropna().astype(int).unique())
+secao_sel = st.sidebar.selectbox("Seção Eleitoral", secoes_disp)
 
 st.sidebar.header("Visualização do Mapa")
 nivel_agregacao = st.sidebar.radio("Agrupar dados por:", ["Colégio (Seções)", "Bairro", "Zona"])
 
 # --- APLICAÇÃO DOS FILTROS FINAIS ---
 mask_est = (df_estatisticas['ano'] == ano_sel) & (df_estatisticas['turno'] == turno_sel) & (df_estatisticas['cargo'] == cargo_sel)
-if bairro_sel != "Todos": mask_est &= (df_estatisticas['bairro'] == bairro_sel)
 if zona_sel != "Todas": mask_est &= (df_estatisticas['zona'] == zona_sel)
+if bairro_sel != "Todos": mask_est &= (df_estatisticas['bairro'] == bairro_sel)
+if sel_local_id is not None: mask_est &= (df_estatisticas['local_id'] == sel_local_id)
 if secao_sel != "Todas": mask_est &= (df_estatisticas['secao'] == secao_sel)
 df_est_filtrado = df_estatisticas[mask_est]
 
 mask_vot = mask_base.copy()
 if partido_sel != "Todos": mask_vot &= (df_votos['sigla_partido'] == partido_sel)
-if bairro_sel != "Todos": mask_vot &= (df_votos['bairro'] == bairro_sel)
 if zona_sel != "Todas": mask_vot &= (df_votos['zona'] == zona_sel)
+if bairro_sel != "Todos": mask_vot &= (df_votos['bairro'] == bairro_sel)
+if sel_local_id is not None: mask_vot &= (df_votos['local_id'] == sel_local_id)
 if secao_sel != "Todas": mask_vot &= (df_votos['secao'] == secao_sel)
 df_votos_filtrado = df_votos[mask_vot]
 
@@ -267,29 +301,32 @@ if len(df_votos_filtrado) > 0:
                 ).add_to(m)
 
     else:
-        # Colégio
+        # Colégio / Local de Votação
         agg_colegio = df_votos_filtrado.dropna(subset=['latitude', 'longitude']).groupby(
-            ['colegio_id', 'latitude', 'longitude', 'zona', 'bairro', 'sigla_partido'])['total_votos'].sum().reset_index()
+            ['local_id', 'nome_local', 'codigo_local', 'endereco', 'latitude', 'longitude', 'zona', 'bairro', 'sigla_partido'])['total_votos'].sum().reset_index()
         
         if len(agg_colegio) > 0:
             if partido_sel == "Todos":
-                idx_venc = agg_colegio.groupby('colegio_id')['total_votos'].idxmax()
-                venc_colegio = agg_colegio.loc[idx_venc]
+                idx_venc = agg_colegio.groupby('local_id')['total_votos'].idxmax()
+                venc_colegio = agg_colegio.loc[idx_venc].copy()
                 
-                # Prepara resultados
-                popup_data = agg_colegio.groupby('colegio_id').apply(
-                    lambda x: x.sort_values('total_votos', ascending=False).head(5)[['sigla_partido', 'total_votos']].to_dict('records')
-                ).reset_index(name='resultados')
-                venc_colegio = venc_colegio.merge(popup_data, on='colegio_id')
+                # Prepara os top 5 partidos mais votados por local
+                top_partidos = agg_colegio.sort_values(['local_id', 'total_votos'], ascending=[True, False]).groupby('local_id').head(5)
+                dict_resultados = {}
+                for lid, group in top_partidos.groupby('local_id'):
+                    dict_resultados[lid] = group[['sigla_partido', 'total_votos']].to_dict('records')
+                venc_colegio['resultados'] = venc_colegio['local_id'].map(dict_resultados)
                 
                 for _, row in venc_colegio.iterrows():
-                    res_str = "<br>".join([f"<b>{r['sigla_partido']}</b>: {r['total_votos']}" for r in row['resultados']])
-                    popup_html = f"<b>Colégio:</b> {row['colegio_id']}<br><b>Bairro:</b> {row['bairro']}<br><b>Zona:</b> {row['zona']}<hr>{res_str}"
+                    res_str = "<br>".join([f"<b>{r['sigla_partido']}</b>: {r['total_votos']:,}".replace(",", ".") for r in (row['resultados'] or [])])
+                    end_str = f"<br><small>{row['endereco']}</small>" if row['endereco'] else ""
+                    cod_str = f" (Local {int(row['codigo_local'])})" if row['codigo_local'] > 0 else ""
+                    popup_html = f"<b>{row['nome_local']}{cod_str}</b><br><b>Bairro:</b> {row['bairro']}<br><b>Zona:</b> {row['zona']}{end_str}<hr>{res_str}"
                     
                     folium.CircleMarker(
                         location=[row['latitude'], row['longitude']],
-                        radius=6, popup=folium.Popup(popup_html, max_width=250),
-                        tooltip=f"Colégio {row['colegio_id']} - Zona {row['zona']}",
+                        radius=6, popup=folium.Popup(popup_html, max_width=280),
+                        tooltip=f"{row['nome_local']} (Z{row['zona']})",
                         color='white', weight=1, fill=True,
                         fillColor=get_color(row['sigla_partido']), fillOpacity=0.9
                     ).add_to(m)
@@ -297,13 +334,15 @@ if len(df_votos_filtrado) > 0:
                 max_votos = agg_colegio['total_votos'].max()
                 for _, row in agg_colegio.iterrows():
                     raio = 5 + (row['total_votos'] / max_votos * 10) if max_votos > 0 else 5
-                    popup_html = f"<b>Colégio:</b> {row['colegio_id']}<br><b>Bairro:</b> {row['bairro']}<br><b>Zona:</b> {row['zona']}<hr><b>{row['sigla_partido']}</b>: {row['total_votos']} votos"
+                    end_str = f"<br><small>{row['endereco']}</small>" if row['endereco'] else ""
+                    cod_str = f" (Local {int(row['codigo_local'])})" if row['codigo_local'] > 0 else ""
+                    popup_html = f"<b>{row['nome_local']}{cod_str}</b><br><b>Bairro:</b> {row['bairro']}<br><b>Zona:</b> {row['zona']}{end_str}<hr><b>{row['sigla_partido']}</b>: {row['total_votos']:,} votos".replace(",", ".")
                     
                     folium.CircleMarker(
                         location=[row['latitude'], row['longitude']],
                         radius=raio,
-                        popup=folium.Popup(popup_html, max_width=250),
-                        tooltip=f"Colégio {row['colegio_id']} - Votos: {row['total_votos']}",
+                        popup=folium.Popup(popup_html, max_width=280),
+                        tooltip=f"{row['nome_local']} - Votos: {row['total_votos']:,}".replace(",", "."),
                         color='white', weight=1, fill=True,
                         fillColor=get_color(row['sigla_partido']), fillOpacity=0.9
                     ).add_to(m)
@@ -318,6 +357,7 @@ st.markdown("### 📋 Detalhamento dos Dados")
 
 df_table = df_votos_filtrado.copy()
 filtro_clique = None
+nome_clique = None
 secoes_informativo = None
 
 if map_data:
@@ -325,9 +365,11 @@ if map_data:
         props = map_data["last_active_drawing"].get("properties", {})
         if nivel_agregacao == "Bairro" and bairro_col in props:
             filtro_clique = props[bairro_col]
+            nome_clique = filtro_clique
             df_table = df_table[df_table['bairro'] == filtro_clique]
         elif nivel_agregacao == "Zona" and "zona" in props:
             filtro_clique = props["zona"]
+            nome_clique = f"Zona {filtro_clique}"
             df_table = df_table[df_table['zona'] == filtro_clique]
     
     if map_data.get("last_object_clicked") and nivel_agregacao == "Colégio (Seções)":
@@ -339,20 +381,27 @@ if map_data:
             if not df_table.empty:
                 idx_min = df_table['dist'].idxmin()
                 if df_table.loc[idx_min, 'dist'] < 0.0001: # Tolerância para o clique
-                    filtro_clique = df_table.loc[idx_min, 'colegio_id']
+                    filtro_clique = df_table.loc[idx_min, 'local_id']
+                    nome_col_clique = df_table.loc[idx_min, 'nome_local']
+                    cod_col_clique = df_table.loc[idx_min, 'codigo_local']
                     bairro_col_nome = df_table.loc[idx_min, 'bairro']
                     zona_col_nome = df_table.loc[idx_min, 'zona']
+                    nome_clique = nome_col_clique
                     
-                    df_colegio = df_table[df_table['colegio_id'] == filtro_clique]
+                    df_colegio = df_table[df_table['local_id'] == filtro_clique]
                     
-                    # Buscar todas as seções desse colégio na base de estatísticas (sem o filtro de partido)
-                    df_est_col = df_est_filtrado[df_est_filtrado['colegio_id'] == filtro_clique]
-                    secoes_list = sorted(df_est_col['secao'].dropna().unique())
+                    # Buscar todas as seções desse local (preferência para df_locais oficial se codigo_local > 0)
+                    if cod_col_clique > 0:
+                        secoes_list = sorted(df_locais[(df_locais['zona'] == zona_col_nome) & (df_locais['codigo_local'] == cod_col_clique)]['secao'].dropna().astype(int).unique())
+                    else:
+                        secoes_list = sorted(df_est_filtrado[df_est_filtrado['local_id'] == filtro_clique]['secao'].dropna().astype(int).unique())
+                    
                     secoes_str = ", ".join([str(int(s)) for s in secoes_list])
+                    cod_str = f" (Local {int(cod_col_clique)})" if cod_col_clique > 0 else ""
                     
-                    secoes_informativo = f"**Colégio {filtro_clique}** (Zona {zona_col_nome} - Bairro {bairro_col_nome})<br>📍 **Seções neste local:** {secoes_str}"
+                    secoes_informativo = f"🏫 **{nome_col_clique}{cod_str}** (Zona {zona_col_nome} - Bairro {bairro_col_nome})<br>📍 **Seções vinculadas a este local:** {secoes_str}"
                     df_table = df_colegio
-            df_table = df_table.drop(columns=['dist'])
+            df_table = df_table.drop(columns=['dist'], errors='ignore')
 
 if secoes_informativo:
     st.info(secoes_informativo)
@@ -368,8 +417,8 @@ elif nivel_agregacao == "Zona":
     else:
         st.info("Mostrando consolidado geral da cidade. Clique em uma Zona no mapa para ver os dados isolados dela!")
 else:
-    if filtro_clique:
-        st.success(f"Mostrando consolidado de votos por partido no Colégio Selecionado.")
+    if nome_clique:
+        st.success(f"Mostrando consolidado de votos por partido no Local de Votação: **{nome_clique}**")
     else:
         st.info("Mostrando consolidado geral. Clique em um Colégio (círculo) no mapa para ver as seções que compõem aquele local e filtrar os dados!")
 
